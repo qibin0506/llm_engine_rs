@@ -7,9 +7,6 @@ use rand::distributions::{Distribution, WeightedIndex};
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::HashSet;
 
-// ==========================================
-// 1. 模型网络结构定义
-// ==========================================
 #[derive(Debug, Clone)]
 pub struct Config {
     pub vocab_size: usize,
@@ -63,13 +60,13 @@ fn apply_rotary_pos_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor
     let half_dim = dim / 2;
     let x1 = x.narrow(D::Minus1, 0, half_dim)?;
     let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
-
+    
     let neg_x2 = x2.neg()?;
     let rotated_x = Tensor::cat(&[&neg_x2, &x1], D::Minus1)?;
-
+    
     let x_cos = x.broadcast_mul(cos)?;
     let rot_sin = rotated_x.broadcast_mul(sin)?;
-
+    
     Ok((x_cos + rot_sin)?)
 }
 
@@ -112,7 +109,7 @@ impl Attention {
     fn forward(&mut self, x: &Tensor, pos: usize) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
         let device = x.device();
-
+        
         let mut q = self.q_proj.forward(x)?.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?;
         let mut k = self.k_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?;
         let v = self.v_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
@@ -120,7 +117,7 @@ impl Attention {
         if let Some(norm) = &self.q_norm { q = norm.forward(&q)?; }
         if let Some(norm) = &self.k_norm { k = norm.forward(&k)?; }
 
-        q = q.transpose(1, 2)?;
+        q = q.transpose(1, 2)?; 
         k = k.transpose(1, 2)?;
 
         let mut inv_freqs = Vec::new();
@@ -146,6 +143,7 @@ impl Attention {
         let k_rot_embed = apply_rotary_pos_emb(&k_rot, &cos, &sin)?;
         let k = Tensor::cat(&[&k_rot_embed, &k_pass], D::Minus1)?;
 
+        // KV Cache 存储更新
         let (k, v) = match &self.kv_cache {
             Some((prev_k, prev_v)) => {
                 let new_k = Tensor::cat(&[prev_k, &k], 2)?;
@@ -156,29 +154,40 @@ impl Attention {
         };
         self.kv_cache = Some((k.clone(), v.clone()));
 
+        // ===============================================
+        // 关键修复：GQA KV Repeat_Interleave
+        // 通过 unsqueeze -> repeat -> reshape 完美对齐 PyTorch
+        // ===============================================
         let k = if self.num_heads != self.num_kv_heads {
             let repeat = self.num_heads / self.num_kv_heads;
-            let mut k_repeated = Vec::new();
-            for _ in 0..repeat { k_repeated.push(k.clone()); }
-            Tensor::cat(&k_repeated, 1)?
+            let (b, kv_heads, s_len, d) = k.dims4()?;
+            k.unsqueeze(2)? // [b, kv_heads, 1, s_len, d]
+             .repeat((1, 1, repeat, 1, 1))? // [b, kv_heads, repeat, s_len, d]
+             .reshape((b, self.num_heads, s_len, d))?
         } else { k };
-
+        
         let v = if self.num_heads != self.num_kv_heads {
             let repeat = self.num_heads / self.num_kv_heads;
-            let mut v_repeated = Vec::new();
-            for _ in 0..repeat { v_repeated.push(v.clone()); }
-            Tensor::cat(&v_repeated, 1)?
+            let (b, kv_heads, s_len, d) = v.dims4()?;
+            v.unsqueeze(2)?
+             .repeat((1, 1, repeat, 1, 1))?
+             .reshape((b, self.num_heads, s_len, d))?
         } else { v };
+        // ===============================================
 
         let scale = 1f64 / f64::sqrt(self.head_dim as f64);
         let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-
+        
+        // 修复版 Causal Mask (兼容多次 chunked prefill)
+        let kv_seq_len = k.dim(2)?;
         let attn_weights = if seq_len > 1 {
             let mask: Vec<_> = (0..seq_len).flat_map(|i| {
-                (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0f32 })
+                (0..kv_seq_len).map(move |j| {
+                    if j > i + pos { f32::NEG_INFINITY } else { 0f32 }
+                })
             }).collect();
-            let mask = Tensor::from_vec(mask, (seq_len, seq_len), device)?
-                       .reshape((1, 1, seq_len, seq_len))?
+            let mask = Tensor::from_vec(mask, (seq_len, kv_seq_len), device)?
+                       .reshape((1, 1, seq_len, kv_seq_len))?
                        .to_dtype(attn_weights.dtype())?;
             attn_weights.broadcast_add(&mask)?
         } else {
@@ -188,7 +197,7 @@ impl Attention {
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
         let attn_output = attn_weights.matmul(&v)?;
         let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
-
+        
         Ok(self.o_proj.forward(&attn_output)?)
     }
 }
@@ -213,7 +222,7 @@ impl Module for Mlp {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let act = (gate.clone() * candle_nn::ops::sigmoid(&gate)?)?;
+        let act = (gate.clone() * candle_nn::ops::sigmoid(&gate)?)?; 
         self.down_proj.forward(&(act * up)?)
     }
 }
@@ -263,7 +272,7 @@ impl LlmModel {
             layers.push(DecoderLayer::load(cfg, vb.pp(&format!("layers.{}", i)))?);
         }
         let head_norm = RmsNorm::load(cfg.hidden_size, cfg.norm_eps, vb.pp("head_norm"))?;
-
+        
         let lm_head = if vb.contains_tensor("lm_head.weight") {
             get_linear(cfg.hidden_size, cfg.vocab_size, cfg.lm_head_bias, vb.pp("lm_head"))?
         } else {
@@ -285,7 +294,7 @@ impl LlmModel {
 }
 
 // ==========================================
-// 2. 采样与生成 API (你写的非常棒的部分)
+// 采样与生成 API
 // ==========================================
 
 fn sample_logits(
@@ -321,7 +330,7 @@ fn sample_logits(
         for (i, &idx) in indices.iter().enumerate() {
             cumsum += probs[idx];
             if cumsum > top_p {
-                cutoff = i + 1;
+                cutoff = i + 1; 
                 break;
             }
         }
@@ -369,7 +378,7 @@ impl LlmEngine {
             partial_rotary_factor: config_dict.get_item("partial_rotary_factor")?.map(|v| v.extract().unwrap_or(1.0)).unwrap_or(1.0),
         };
 
-        let device = Device::Cpu;
+        let device = Device::Cpu; 
         let dtype = DType::F32;
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))? };
@@ -464,7 +473,7 @@ impl LlmEngine {
             }
 
             current_pos += current_input.len();
-            current_input = vec![next_token];
+            current_input = vec![next_token]; 
         }
 
         Ok(generated_tokens)
