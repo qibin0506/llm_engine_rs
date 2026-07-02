@@ -1,6 +1,6 @@
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_nn::{linear, linear_no_bias, Embedding, Linear, Module, VarBuilder};
+use candle_nn::{linear, linear_no_bias, Linear, Module, VarBuilder};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rand::distributions::{Distribution, WeightedIndex};
@@ -60,13 +60,13 @@ fn apply_rotary_pos_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor
     let half_dim = dim / 2;
     let x1 = x.narrow(D::Minus1, 0, half_dim)?;
     let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
-
+    
     let neg_x2 = x2.neg()?;
     let rotated_x = Tensor::cat(&[&neg_x2, &x1], D::Minus1)?;
-
+    
     let x_cos = x.broadcast_mul(cos)?;
     let rot_sin = rotated_x.broadcast_mul(sin)?;
-
+    
     Ok((x_cos + rot_sin)?)
 }
 
@@ -109,7 +109,7 @@ impl Attention {
     fn forward(&mut self, x: &Tensor, pos: usize) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
         let device = x.device();
-
+        
         let mut q = self.q_proj.forward(x)?.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?;
         let mut k = self.k_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?;
         let v = self.v_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
@@ -117,7 +117,7 @@ impl Attention {
         if let Some(norm) = &self.q_norm { q = norm.forward(&q)?; }
         if let Some(norm) = &self.k_norm { k = norm.forward(&k)?; }
 
-        q = q.transpose(1, 2)?;
+        q = q.transpose(1, 2)?; 
         k = k.transpose(1, 2)?;
 
         let mut inv_freqs = Vec::new();
@@ -143,7 +143,6 @@ impl Attention {
         let k_rot_embed = apply_rotary_pos_emb(&k_rot, &cos, &sin)?;
         let k = Tensor::cat(&[&k_rot_embed, &k_pass], D::Minus1)?;
 
-        // KV Cache 存储更新
         let (k, v) = match &self.kv_cache {
             Some((prev_k, prev_v)) => {
                 let new_k = Tensor::cat(&[prev_k, &k], 2)?;
@@ -154,31 +153,26 @@ impl Attention {
         };
         self.kv_cache = Some((k.clone(), v.clone()));
 
-        // ===============================================
-        // 关键修复：GQA KV Repeat_Interleave
-        // 通过 unsqueeze -> repeat -> reshape 完美对齐 PyTorch
-        // ===============================================
+        // 修复 unused warning: 将 kv_heads 替换为 _kv_heads
         let k = if self.num_heads != self.num_kv_heads {
             let repeat = self.num_heads / self.num_kv_heads;
-            let (b, kv_heads, s_len, d) = k.dims4()?;
-            k.unsqueeze(2)? // [b, kv_heads, 1, s_len, d]
-             .repeat((1, 1, repeat, 1, 1))? // [b, kv_heads, repeat, s_len, d]
+            let (b, _kv_heads, s_len, d) = k.dims4()?;
+            k.unsqueeze(2)? 
+             .repeat((1, 1, repeat, 1, 1))? 
              .reshape((b, self.num_heads, s_len, d))?
         } else { k };
-
+        
         let v = if self.num_heads != self.num_kv_heads {
             let repeat = self.num_heads / self.num_kv_heads;
-            let (b, kv_heads, s_len, d) = v.dims4()?;
+            let (b, _kv_heads, s_len, d) = v.dims4()?;
             v.unsqueeze(2)?
              .repeat((1, 1, repeat, 1, 1))?
              .reshape((b, self.num_heads, s_len, d))?
         } else { v };
-        // ===============================================
 
         let scale = 1f64 / f64::sqrt(self.head_dim as f64);
         let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-
-        // 修复版 Causal Mask (兼容多次 chunked prefill)
+        
         let kv_seq_len = k.dim(2)?;
         let attn_weights = if seq_len > 1 {
             let mask: Vec<_> = (0..seq_len).flat_map(|i| {
@@ -197,7 +191,7 @@ impl Attention {
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
         let attn_output = attn_weights.matmul(&v)?;
         let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
-
+        
         Ok(self.o_proj.forward(&attn_output)?)
     }
 }
@@ -222,7 +216,7 @@ impl Module for Mlp {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let act = (gate.clone() * candle_nn::ops::sigmoid(&gate)?)?;
+        let act = (gate.clone() * candle_nn::ops::sigmoid(&gate)?)?; 
         self.down_proj.forward(&(act * up)?)
     }
 }
@@ -272,7 +266,7 @@ impl LlmModel {
             layers.push(DecoderLayer::load(cfg, vb.pp(&format!("layers.{}", i)))?);
         }
         let head_norm = RmsNorm::load(cfg.hidden_size, cfg.norm_eps, vb.pp("head_norm"))?;
-
+        
         let lm_head = if vb.contains_tensor("lm_head.weight") {
             get_linear(cfg.hidden_size, cfg.vocab_size, cfg.lm_head_bias, vb.pp("lm_head"))?
         } else {
@@ -292,10 +286,6 @@ impl LlmModel {
         Ok(self.lm_head.forward(&x)?)
     }
 }
-
-// ==========================================
-// 采样与生成 API
-// ==========================================
 
 fn sample_logits(
     logits: &mut [f32],
@@ -330,7 +320,7 @@ fn sample_logits(
         for (i, &idx) in indices.iter().enumerate() {
             cumsum += probs[idx];
             if cumsum > top_p {
-                cutoff = i + 1;
+                cutoff = i + 1; 
                 break;
             }
         }
@@ -393,7 +383,6 @@ impl LlmEngine {
         }
     }
 
-    // 保留原有的完整生成 API
     #[pyo3(signature = (input_ids, max_new_tokens, temperature=1.0, top_k=None, top_p=None, repetition_penalty=1.0, exclude_penalty_tokens=None, suppress_tokens=None, eos_token_id=2, seed=42))]
     pub fn generate(
         &mut self,
@@ -408,27 +397,37 @@ impl LlmEngine {
         eos_token_id: u32,
         seed: u64,
     ) -> PyResult<Vec<u32>> {
-        // (省略内部代码，和你之前贴的一模一样)
         self.clear_kv_cache();
+
         let temp = temperature.unwrap_or(1.0);
         let top_k = top_k.unwrap_or(0);
         let top_p = top_p.unwrap_or(1.0);
         let rep_penalty = repetition_penalty.unwrap_or(1.0);
         let exclude_tokens: HashSet<u32> = exclude_penalty_tokens.unwrap_or_default().into_iter().collect();
         let suppress_set: HashSet<u32> = suppress_tokens.unwrap_or_default().into_iter().collect();
+
         let mut rng = StdRng::seed_from_u64(seed);
         let mut generated_tokens: Vec<u32> = Vec::new();
+
         let mut current_pos = 0;
         let mut current_input = input_ids.clone();
 
         for _ in 0..max_new_tokens {
             let input_tensor = Tensor::new(current_input.as_slice(), &self.device)
-                .and_then(|t| t.unsqueeze(0)).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            let logits_tensor = self.model.forward(&input_tensor, current_pos).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            let mut logits = logits_tensor.squeeze(0).and_then(|t| t.to_vec1::<f32>()).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let logits_tensor = self.model.forward(&input_tensor, current_pos)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let mut logits = logits_tensor.squeeze(0)
+                .and_then(|t| t.to_vec1::<f32>())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
             for &token in &suppress_set {
-                if (token as usize) < logits.len() { logits[token as usize] = f32::NEG_INFINITY; }
+                if (token as usize) < logits.len() {
+                    logits[token as usize] = f32::NEG_INFINITY;
+                }
             }
 
             if rep_penalty > 0.0 && (rep_penalty - 1.0).abs() > 1e-4 {
@@ -440,18 +439,25 @@ impl LlmEngine {
                 }
             }
 
-            let next_token = if temp > 0.0 { sample_logits(&mut logits, temp, top_k, top_p, &mut rng) } else { logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32 };
+            let next_token = if temp > 0.0 {
+                sample_logits(&mut logits, temp, top_k, top_p, &mut rng)
+            } else {
+                logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32
+            };
+
             generated_tokens.push(next_token);
-            if next_token == eos_token_id { break; }
+
+            if next_token == eos_token_id {
+                break;
+            }
+
             current_pos += current_input.len();
             current_input = vec![next_token]; 
         }
+
         Ok(generated_tokens)
     }
 
-    /// =========================================
-    /// ✨ 新增：流式生成 API，返回一个 Python 迭代器
-    /// =========================================
     #[pyo3(signature = (input_ids, max_new_tokens, temperature=1.0, top_k=None, top_p=None, repetition_penalty=1.0, exclude_penalty_tokens=None, suppress_tokens=None, eos_token_id=2, seed=42))]
     pub fn streaming_generate(
         slf: Py<Self>,
@@ -473,9 +479,9 @@ impl LlmEngine {
         let exclude_tokens: HashSet<u32> = exclude_penalty_tokens.unwrap_or_default().into_iter().collect();
         let suppress_tokens: HashSet<u32> = suppress_tokens.unwrap_or_default().into_iter().collect();
 
-        // 构造返回给 Python 的状态机
+        // 修复 E0599: 使用 clone_ref(py)
         Ok(LlmStreamer {
-            engine: slf.clone(),
+            engine: slf.clone_ref(py),
             rng: StdRng::seed_from_u64(seed),
             current_input: input_ids,
             current_pos: 0,
@@ -493,7 +499,6 @@ impl LlmEngine {
     }
 }
 
-/// 这是一个实现了 Python Iterator 协议的 Rust 结构体
 #[pyclass(unsendable)]
 pub struct LlmStreamer {
     engine: Py<LlmEngine>,
@@ -519,25 +524,26 @@ impl LlmStreamer {
     }
 
     fn __next__(mut slf: PyRefMut<'_, Self>, py: Python) -> PyResult<Option<u32>> {
-        // 达到生成上限，终止迭代 (抛出 StopIteration)
         if slf.tokens_generated_count >= slf.max_new_tokens {
             return Ok(None);
         }
 
-        // 获取底层 LlmEngine 的可变引用
-        let mut engine = slf.engine.borrow_mut(py);
+        // 修复 E0502: 利用局部作用域 {} 限制 engine 的借用生命周期
+        let mut logits = {
+            let mut engine = slf.engine.borrow_mut(py);
 
-        // --- 1. 前向传播 ---
-        let input_tensor = Tensor::new(slf.current_input.as_slice(), &engine.device)
-            .and_then(|t| t.unsqueeze(0))
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            // --- 1. 前向传播 ---
+            let input_tensor = Tensor::new(slf.current_input.as_slice(), &engine.device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        let logits_tensor = engine.model.forward(&input_tensor, slf.current_pos)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let logits_tensor = engine.model.forward(&input_tensor, slf.current_pos)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        let mut logits = logits_tensor.squeeze(0)
-            .and_then(|t| t.to_vec1::<f32>())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            logits_tensor.squeeze(0)
+                .and_then(|t| t.to_vec1::<f32>())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+        }; // 此处 engine 可变借用被完全释放！
 
         // --- 2. 应用各种惩罚 ---
         for &token in &slf.suppress_tokens {
@@ -570,11 +576,9 @@ impl LlmStreamer {
         slf.current_input = vec![next_token];
 
         if next_token == slf.eos_token_id {
-            // 标记下次迭代直接结束
             slf.tokens_generated_count = slf.max_new_tokens; 
         }
 
-        // 将当前 token yield 给 Python
         Ok(Some(next_token))
     }
 }
@@ -582,6 +586,6 @@ impl LlmStreamer {
 #[pymodule]
 fn llm_engine_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LlmEngine>()?;
-    m.add_class::<LlmStreamer>()?; // 注册流式发生器
+    m.add_class::<LlmStreamer>()?;
     Ok(())
 }
