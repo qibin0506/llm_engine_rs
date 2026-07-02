@@ -1,0 +1,15 @@
+[package]
+name = "llm_engine_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "llm_engine_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+candle-core = "0.7.2"
+candle-nn = "0.7.2"
+pyo3 = { version = "0.28", features = ["extension-module"] }
+anyhow = "1.0"
+rand = "0.8.5"
