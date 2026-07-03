@@ -60,13 +60,13 @@ fn apply_rotary_pos_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor
     let half_dim = dim / 2;
     let x1 = x.narrow(D::Minus1, 0, half_dim)?;
     let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
-    
+
     let neg_x2 = x2.neg()?;
     let rotated_x = Tensor::cat(&[&neg_x2, &x1], D::Minus1)?;
-    
+
     let x_cos = x.broadcast_mul(cos)?;
     let rot_sin = rotated_x.broadcast_mul(sin)?;
-    
+
     Ok((x_cos + rot_sin)?)
 }
 
@@ -109,7 +109,7 @@ impl Attention {
     fn forward(&mut self, x: &Tensor, pos: usize) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
         let device = x.device();
-        
+
         let mut q = self.q_proj.forward(x)?.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?;
         let mut k = self.k_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?;
         let v = self.v_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
@@ -117,7 +117,7 @@ impl Attention {
         if let Some(norm) = &self.q_norm { q = norm.forward(&q)?; }
         if let Some(norm) = &self.k_norm { k = norm.forward(&k)?; }
 
-        q = q.transpose(1, 2)?; 
+        q = q.transpose(1, 2)?;
         k = k.transpose(1, 2)?;
 
         let mut inv_freqs = Vec::new();
@@ -130,8 +130,9 @@ impl Attention {
         }
         let freqs = Tensor::from_vec(freqs_vec, (seq_len, self.rot_dim / 2), device)?;
         let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
-        let cos = emb.cos()?.reshape((1, 1, seq_len, self.rot_dim))?;
-        let sin = emb.sin()?.reshape((1, 1, seq_len, self.rot_dim))?;
+        // 注意这里：显式将生成的 cos/sin 转换成和输入 x 一样的 dtype
+        let cos = emb.cos()?.reshape((1, 1, seq_len, self.rot_dim))?.to_dtype(x.dtype())?;
+        let sin = emb.sin()?.reshape((1, 1, seq_len, self.rot_dim))?.to_dtype(x.dtype())?;
 
         let q_rot = q.narrow(D::Minus1, 0, self.rot_dim)?;
         let q_pass = q.narrow(D::Minus1, self.rot_dim, self.head_dim - self.rot_dim)?;
@@ -153,15 +154,14 @@ impl Attention {
         };
         self.kv_cache = Some((k.clone(), v.clone()));
 
-        // 修复 unused warning: 将 kv_heads 替换为 _kv_heads
         let k = if self.num_heads != self.num_kv_heads {
             let repeat = self.num_heads / self.num_kv_heads;
             let (b, _kv_heads, s_len, d) = k.dims4()?;
-            k.unsqueeze(2)? 
-             .repeat((1, 1, repeat, 1, 1))? 
+            k.unsqueeze(2)?
+             .repeat((1, 1, repeat, 1, 1))?
              .reshape((b, self.num_heads, s_len, d))?
         } else { k };
-        
+
         let v = if self.num_heads != self.num_kv_heads {
             let repeat = self.num_heads / self.num_kv_heads;
             let (b, _kv_heads, s_len, d) = v.dims4()?;
@@ -172,7 +172,7 @@ impl Attention {
 
         let scale = 1f64 / f64::sqrt(self.head_dim as f64);
         let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        
+
         let kv_seq_len = k.dim(2)?;
         let attn_weights = if seq_len > 1 {
             let mask: Vec<_> = (0..seq_len).flat_map(|i| {
@@ -191,7 +191,7 @@ impl Attention {
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
         let attn_output = attn_weights.matmul(&v)?;
         let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
-        
+
         Ok(self.o_proj.forward(&attn_output)?)
     }
 }
@@ -216,7 +216,7 @@ impl Module for Mlp {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let act = (gate.clone() * candle_nn::ops::sigmoid(&gate)?)?; 
+        let act = (gate.clone() * candle_nn::ops::sigmoid(&gate)?)?;
         self.down_proj.forward(&(act * up)?)
     }
 }
@@ -266,7 +266,7 @@ impl LlmModel {
             layers.push(DecoderLayer::load(cfg, vb.pp(&format!("layers.{}", i)))?);
         }
         let head_norm = RmsNorm::load(cfg.hidden_size, cfg.norm_eps, vb.pp("head_norm"))?;
-        
+
         let lm_head = if vb.contains_tensor("lm_head.weight") {
             get_linear(cfg.hidden_size, cfg.vocab_size, cfg.lm_head_bias, vb.pp("lm_head"))?
         } else {
@@ -320,7 +320,7 @@ fn sample_logits(
         for (i, &idx) in indices.iter().enumerate() {
             cumsum += probs[idx];
             if cumsum > top_p {
-                cutoff = i + 1; 
+                cutoff = i + 1;
                 break;
             }
         }
@@ -345,7 +345,8 @@ pub struct LlmEngine {
 #[pymethods]
 impl LlmEngine {
     #[new]
-    pub fn new(weights_path: &str, config_dict: &Bound<'_, PyDict>) -> PyResult<Self> {
+    #[pyo3(signature = (weights_path, config_dict, dtype="fp32", device="cpu"))]
+    pub fn new(weights_path: &str, config_dict: &Bound<'_, PyDict>, dtype: &str, device: &str) -> PyResult<Self> {
         let cfg = Config {
             vocab_size: config_dict.get_item("vocab_size")?.expect("Missing vocab_size").extract()?,
             hidden_size: config_dict.get_item("hidden_size")?.expect("Missing hidden_size").extract()?,
@@ -368,10 +369,25 @@ impl LlmEngine {
             partial_rotary_factor: config_dict.get_item("partial_rotary_factor")?.map(|v| v.extract().unwrap_or(1.0)).unwrap_or(1.0),
         };
 
-        let device = Device::Cpu; 
-        let dtype = DType::F32;
+        // 动态解析设备参数
+        let dev_str = device.to_lowercase();
+        let device = if dev_str.starts_with("cuda") {
+            let idx = dev_str.split(':').nth(1).unwrap_or("0").parse::<usize>().unwrap_or(0);
+            Device::new_cuda(idx).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("CUDA initialization failed: {}", e)))?
+        } else if dev_str == "metal" || dev_str == "mps" {
+            Device::new_metal(0).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Metal/MPS initialization failed: {}", e)))?
+        } else {
+            Device::Cpu
+        };
 
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))? };
+        // 动态支持 dtype
+        let dt = match dtype.to_lowercase().as_str() {
+            "fp16" | "float16" => DType::F16,
+            "bf16" | "bfloat16" => DType::BF16,
+            _ => DType::F32,
+        };
+
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dt, &device).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))? };
         let model = LlmModel::load(&cfg, vb).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         Ok(Self { model, device })
@@ -420,7 +436,10 @@ impl LlmEngine {
             let logits_tensor = self.model.forward(&input_tensor, current_pos)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-            let mut logits = logits_tensor.squeeze(0)
+            // 提取最新一帧的 Logits 并强转回 F32 用于采样
+            let mut logits = logits_tensor
+                .to_dtype(DType::F32).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .squeeze(0)
                 .and_then(|t| t.to_vec1::<f32>())
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
@@ -452,7 +471,7 @@ impl LlmEngine {
             }
 
             current_pos += current_input.len();
-            current_input = vec![next_token]; 
+            current_input = vec![next_token];
         }
 
         Ok(generated_tokens)
@@ -473,13 +492,11 @@ impl LlmEngine {
         eos_token_id: u32,
         seed: u64,
     ) -> PyResult<LlmStreamer> {
-        // 先借用底层引擎清空缓存
         slf.borrow_mut(py).clear_kv_cache();
 
         let exclude_tokens: HashSet<u32> = exclude_penalty_tokens.unwrap_or_default().into_iter().collect();
         let suppress_tokens: HashSet<u32> = suppress_tokens.unwrap_or_default().into_iter().collect();
 
-        // 修复 E0599: 使用 clone_ref(py)
         Ok(LlmStreamer {
             engine: slf.clone_ref(py),
             rng: StdRng::seed_from_u64(seed),
@@ -528,11 +545,9 @@ impl LlmStreamer {
             return Ok(None);
         }
 
-        // 修复 E0502: 利用局部作用域 {} 限制 engine 的借用生命周期
         let mut logits = {
             let mut engine = slf.engine.borrow_mut(py);
 
-            // --- 1. 前向传播 ---
             let input_tensor = Tensor::new(slf.current_input.as_slice(), &engine.device)
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
@@ -540,12 +555,14 @@ impl LlmStreamer {
             let logits_tensor = engine.model.forward(&input_tensor, slf.current_pos)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-            logits_tensor.squeeze(0)
+            // 强转回 F32 用于安全采样
+            logits_tensor
+                .to_dtype(DType::F32).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .squeeze(0)
                 .and_then(|t| t.to_vec1::<f32>())
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-        }; // 此处 engine 可变借用被完全释放！
+        };
 
-        // --- 2. 应用各种惩罚 ---
         for &token in &slf.suppress_tokens {
             if (token as usize) < logits.len() {
                 logits[token as usize] = f32::NEG_INFINITY;
@@ -561,22 +578,20 @@ impl LlmStreamer {
             }
         }
 
-        // --- 3. 采样 ---
         let next_token = if slf.temperature > 0.0 {
             sample_logits(&mut logits, slf.temperature, slf.top_k, slf.top_p, &mut slf.rng)
         } else {
             logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32
         };
 
-        // --- 4. 维护状态机 ---
         slf.generated_tokens.push(next_token);
         slf.tokens_generated_count += 1;
-        
+
         slf.current_pos += slf.current_input.len();
         slf.current_input = vec![next_token];
 
         if next_token == slf.eos_token_id {
-            slf.tokens_generated_count = slf.max_new_tokens; 
+            slf.tokens_generated_count = slf.max_new_tokens;
         }
 
         Ok(Some(next_token))
