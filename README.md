@@ -1,6 +1,17 @@
 # llm_engine_rs
 
 ``` python
+# 使用 CPU
+engine = llm_engine_rs.LlmEngine("model.safetensors", config_dict, dtype="fp16", device="cpu")
+
+# 使用第一张 Nvidia GPU
+engine = llm_engine_rs.LlmEngine("model.safetensors", config_dict, dtype="fp16", device="cuda:0")
+
+# 使用 Mac 的 M 芯片 GPU (Apple Silicon)
+engine = llm_engine_rs.LlmEngine("model.safetensors", config_dict, dtype="fp16", device="mps")
+```
+
+``` python
 config_dict = {
     "vocab_size": 151936,
     "hidden_size": 1024,
