@@ -239,7 +239,7 @@ impl GatedDeltaNet {
         let dt_b = self.dt_bias.reshape((1, 1, self.num_heads))?.broadcast_as((b, t, self.num_heads))?;
         let dt = stable_softplus(&(alpha_logits + dt_b)?)?;
         let a_log_exp = self.a_log.exp()?.reshape((1, 1, self.num_heads))?.broadcast_as((b, t, self.num_heads))?;
-        let g_decay = (dt.neg()? * a_log_exp)?;
+        let g_decay = (dt.neg()? * a_log_exp)?; 
         let alpha = g_decay.exp()?; // [b, t, num_heads]
 
         // Q,K 归一化与缩放
@@ -263,10 +263,10 @@ impl GatedDeltaNet {
             let b_i = beta.narrow(1, i, 1)?.squeeze(1)?.reshape((b, self.num_heads, 1))?;
 
             curr_state = curr_state.broadcast_mul(&a_i)?;
-
+            
             let v_pred = k_i.unsqueeze(2)?.matmul(&curr_state)?.squeeze(2)?;
             let v_err = (v_i - v_pred)?;
-
+            
             let b_v_err = v_err.broadcast_mul(&b_i)?;
             let delta_s = k_i.unsqueeze(3)?.matmul(&b_v_err.unsqueeze(2)?)?;
             curr_state = (curr_state + delta_s)?;
@@ -281,8 +281,9 @@ impl GatedDeltaNet {
         let out = self.g_norm.forward(&out)?;
         let out = (out * candle_nn::ops::silu(&g)?)?;
         let out = out.reshape((b, t, self.num_heads * self.head_dim))?;
-
-        self.o_proj.forward(&out)
+        
+        // 修复：添加 Ok(...) 以转换 error type
+        Ok(self.o_proj.forward(&out)?)
     }
 }
 
@@ -309,7 +310,7 @@ struct Attention {
 impl Attention {
     fn load(cfg: &Config, vb: VarBuilder, layer_idx: usize) -> Result<Self> {
         let is_hybrid_softmax = cfg.attention_type == "hybrid" && resolve_layer_type(cfg, layer_idx) == LayerType::Softmax;
-
+        
         let num_heads = if is_hybrid_softmax { cfg.hybrid_softmax_num_heads.unwrap_or(cfg.num_attention_heads) } else { cfg.num_attention_heads };
         let num_kv_heads = if is_hybrid_softmax { cfg.hybrid_softmax_num_kv_heads.unwrap_or(cfg.num_key_value_heads) } else { cfg.num_key_value_heads };
         let head_dim = if is_hybrid_softmax { cfg.hybrid_softmax_head_dim.unwrap_or(cfg.head_dim) } else { cfg.head_dim };
@@ -342,7 +343,7 @@ impl Attention {
         let device = x.device();
 
         let q_out = self.q_proj.forward(x)?;
-
+        
         let (mut q, gate) = if self.is_gated {
             let q_out = q_out.reshape((b_sz, seq_len, self.num_heads, self.head_dim * 2))?;
             let q = q_out.narrow(D::Minus1, 0, self.head_dim)?;
@@ -430,9 +431,9 @@ impl Attention {
 
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
         let mut attn_output = attn_weights.matmul(&v)?;
-
+        
         attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
-
+        
         // Gated Attention 拦截
         if let Some(g) = gate {
             attn_output = (attn_output * candle_nn::ops::sigmoid(&g.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?))?;
@@ -647,7 +648,7 @@ impl LlmEngine {
             lm_head_bias: config_dict.get_item("lm_head_bias")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
             rope_theta: config_dict.get_item("rope_theta")?.map(|v| v.extract().unwrap_or(10000.0)).unwrap_or(10000.0),
             partial_rotary_factor: config_dict.get_item("partial_rotary_factor")?.map(|v| v.extract().unwrap_or(1.0)).unwrap_or(1.0),
-
+            
             // 安全提取并降级 Hybrid 和 GDN 参数
             attention_type: config_dict.get_item("attention_type")?.map(|v| v.extract().unwrap_or_else(|_| "softmax".to_string())).unwrap_or_else(|| "softmax".to_string()),
             hybrid_ratio: config_dict.get_item("hybrid_ratio")?.map(|v| v.extract().unwrap_or_else(|_| "3:1".to_string())).unwrap_or_else(|| "3:1".to_string()),
