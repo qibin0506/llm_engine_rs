@@ -69,7 +69,6 @@ fn get_linear(in_dim: usize, out_dim: usize, bias: bool, vb: VarBuilder) -> Resu
     }
 }
 
-// 稳定的 Softplus 函数
 fn stable_softplus(x: &Tensor) -> Result<Tensor> {
     let zeros = x.zeros_like()?;
     let threshold = x.maximum(&zeros)?;
@@ -77,7 +76,6 @@ fn stable_softplus(x: &Tensor) -> Result<Tensor> {
     (threshold + (exp_neg_abs + 1.0)?.log()?).map_err(E::msg)
 }
 
-// L2 Norm
 fn l2_norm(x: &Tensor) -> Result<Tensor> {
     let sqr_sum = x.sqr()?.sum_keepdim(D::Minus1)?;
     x.broadcast_div(&(sqr_sum + 1e-6)?.sqrt()?).map_err(E::msg)
@@ -107,8 +105,10 @@ impl Module for RmsNorm {
 fn apply_rotary_pos_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let dim = x.dim(D::Minus1)?;
     let half_dim = dim / 2;
-    let x1 = x.narrow(D::Minus1, 0, half_dim)?;
-    let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
+    
+    // ⭐ 保证 narrow 切片后的连续性
+    let x1 = x.narrow(D::Minus1, 0, half_dim)?.contiguous()?;
+    let x2 = x.narrow(D::Minus1, half_dim, half_dim)?.contiguous()?;
 
     let neg_x2 = x2.neg()?;
     let rotated_x = Tensor::cat(&[&neg_x2, &x1], D::Minus1)?;
@@ -119,9 +119,6 @@ fn apply_rotary_pos_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor
     Ok((x_cos + rot_sin)?)
 }
 
-// ==========================================
-// 1D 短卷积，支持状态缓存
-// ==========================================
 struct ShortConv {
     conv: candle_nn::Conv1d,
     kernel_size: usize,
@@ -145,28 +142,27 @@ impl ShortConv {
     }
 
     fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
-        let x_t = x.transpose(1, 2)?; // [b, d, t]
+        let x_t = x.transpose(1, 2)?.contiguous()?; // [b, d, t]
         let (out, new_state) = if let Some(prev) = &self.state {
             let x_cat = Tensor::cat(&[prev, &x_t], D::Minus1)?;
             let out = self.conv.forward(&x_cat)?;
-            let new_state = x_cat.narrow(D::Minus1, x_cat.dim(D::Minus1)? - (self.kernel_size - 1), self.kernel_size - 1)?;
+            // ⭐ 保证 narrow 切片后的连续性
+            let new_state = x_cat.narrow(D::Minus1, x_cat.dim(D::Minus1)? - (self.kernel_size - 1), self.kernel_size - 1)?.contiguous()?;
             (out, new_state)
         } else {
             let (b, c, _) = x_t.dims3()?;
             let zeros = Tensor::zeros((b, c, self.kernel_size - 1), x_t.dtype(), x_t.device())?;
             let x_padded = Tensor::cat(&[&zeros, &x_t], D::Minus1)?;
             let out = self.conv.forward(&x_padded)?;
-            let new_state = x_padded.narrow(D::Minus1, x_padded.dim(D::Minus1)? - (self.kernel_size - 1), self.kernel_size - 1)?;
+            // ⭐ 保证 narrow 切片后的连续性
+            let new_state = x_padded.narrow(D::Minus1, x_padded.dim(D::Minus1)? - (self.kernel_size - 1), self.kernel_size - 1)?.contiguous()?;
             (out, new_state)
         };
         self.state = Some(new_state);
-        out.transpose(1, 2).map_err(E::msg)
+        out.transpose(1, 2)?.contiguous().map_err(E::msg)
     }
 }
 
-// ==========================================
-// Gated DeltaNet 注意力机制
-// ==========================================
 struct GatedDeltaNet {
     q_proj: Linear,
     k_proj: Linear,
@@ -235,20 +231,17 @@ impl GatedDeltaNet {
         let v = candle_nn::ops::silu(&v)?.reshape((b, t, self.num_heads, self.head_dim))?;
         let g = g.reshape((b, t, self.num_heads, self.head_dim))?;
 
-        // Mamba 风格遗忘门
         let dt_b = self.dt_bias.reshape((1, 1, self.num_heads))?.broadcast_as((b, t, self.num_heads))?;
         let dt = stable_softplus(&(alpha_logits + dt_b)?)?;
         let a_log_exp = self.a_log.exp()?.reshape((1, 1, self.num_heads))?.broadcast_as((b, t, self.num_heads))?;
         let g_decay = (dt.neg()? * a_log_exp)?; 
-        let alpha = g_decay.exp()?; // [b, t, num_heads]
+        let alpha = g_decay.exp()?; 
 
-        // Q,K 归一化与缩放
         let q = l2_norm(&q)?;
         let k = l2_norm(&k)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let q = (q * scale)?;
 
-        // 回退到循环计算
         let mut curr_state = match &self.recurrent_state {
             Some(state) => state.clone(),
             None => Tensor::zeros((b, self.num_heads, self.head_dim, self.head_dim), q.dtype(), q.device())?
@@ -256,11 +249,12 @@ impl GatedDeltaNet {
 
         let mut out_list = Vec::with_capacity(t);
         for i in 0..t {
-            let q_i = q.narrow(1, i, 1)?.squeeze(1)?;
-            let k_i = k.narrow(1, i, 1)?.squeeze(1)?;
-            let v_i = v.narrow(1, i, 1)?.squeeze(1)?;
-            let a_i = alpha.narrow(1, i, 1)?.squeeze(1)?.reshape((b, self.num_heads, 1, 1))?;
-            let b_i = beta.narrow(1, i, 1)?.squeeze(1)?.reshape((b, self.num_heads, 1))?;
+            // ⭐ 保证所有循环内 narrow 切片的连续性！
+            let q_i = q.narrow(1, i, 1)?.squeeze(1)?.contiguous()?;
+            let k_i = k.narrow(1, i, 1)?.squeeze(1)?.contiguous()?;
+            let v_i = v.narrow(1, i, 1)?.squeeze(1)?.contiguous()?;
+            let a_i = alpha.narrow(1, i, 1)?.squeeze(1)?.reshape((b, self.num_heads, 1, 1))?.contiguous()?;
+            let b_i = beta.narrow(1, i, 1)?.squeeze(1)?.reshape((b, self.num_heads, 1))?.contiguous()?;
 
             curr_state = curr_state.broadcast_mul(&a_i)?;
             
@@ -282,15 +276,10 @@ impl GatedDeltaNet {
         let out = (out * candle_nn::ops::silu(&g)?)?;
         let out = out.reshape((b, t, self.num_heads * self.head_dim))?;
         
-        // 修复：添加 Ok(...) 以转换 error type
         Ok(self.o_proj.forward(&out)?)
     }
 }
 
-
-// ==========================================
-// Softmax 异构注意力
-// ==========================================
 struct Attention {
     q_proj: Linear,
     k_proj: Linear,
@@ -331,7 +320,7 @@ impl Attention {
             num_heads,
             num_kv_heads,
             head_dim,
-            rot_dim: (cfg.head_dim as f32 * cfg.partial_rotary_factor) as usize, // RoPE 依旧使用全局特征维度
+            rot_dim: (cfg.head_dim as f32 * cfg.partial_rotary_factor) as usize, 
             theta: cfg.rope_theta,
             is_gated,
             kv_cache: None,
@@ -344,23 +333,24 @@ impl Attention {
 
         let q_out = self.q_proj.forward(x)?;
         
+        // ⭐ 修复致命 Bug：按各头 reshape 后在最后一个维度切分，并保证连续性！
         let (mut q, gate) = if self.is_gated {
-            let q_out = q_out.reshape((b_sz, seq_len, self.num_heads, self.head_dim * 2))?;
-            let q = q_out.narrow(D::Minus1, 0, self.head_dim)?;
-            let gate = q_out.narrow(D::Minus1, self.head_dim, self.head_dim)?;
-            (q, Some(gate))
+            let q_out_reshaped = q_out.reshape((b_sz, seq_len, self.num_heads, self.head_dim * 2))?;
+            let q_slice = q_out_reshaped.narrow(D::Minus1, 0, self.head_dim)?.contiguous()?;
+            let gate_slice = q_out_reshaped.narrow(D::Minus1, self.head_dim, self.head_dim)?.contiguous()?;
+            (q_slice, Some(gate_slice))
         } else {
             (q_out.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?, None)
         };
 
         let mut k = self.k_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?;
-        let v = self.v_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
+        let v = self.v_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
 
         if let Some(norm) = &self.q_norm { q = norm.forward(&q)?; }
         if let Some(norm) = &self.k_norm { k = norm.forward(&k)?; }
 
-        q = q.transpose(1, 2)?;
-        k = k.transpose(1, 2)?;
+        q = q.transpose(1, 2)?.contiguous()?;
+        k = k.transpose(1, 2)?.contiguous()?;
 
         let mut inv_freqs = Vec::new();
         for i in (0..self.rot_dim).step_by(2) {
@@ -375,13 +365,13 @@ impl Attention {
         let cos = emb.cos()?.reshape((1, 1, seq_len, self.rot_dim))?.to_dtype(x.dtype())?;
         let sin = emb.sin()?.reshape((1, 1, seq_len, self.rot_dim))?.to_dtype(x.dtype())?;
 
-        let q_rot = q.narrow(D::Minus1, 0, self.rot_dim)?;
-        let q_pass = q.narrow(D::Minus1, self.rot_dim, self.head_dim - self.rot_dim)?;
+        let q_rot = q.narrow(D::Minus1, 0, self.rot_dim)?.contiguous()?;
+        let q_pass = q.narrow(D::Minus1, self.rot_dim, self.head_dim - self.rot_dim)?.contiguous()?;
         let q_rot_embed = apply_rotary_pos_emb(&q_rot, &cos, &sin)?;
         let q = Tensor::cat(&[&q_rot_embed, &q_pass], D::Minus1)?;
 
-        let k_rot = k.narrow(D::Minus1, 0, self.rot_dim)?;
-        let k_pass = k.narrow(D::Minus1, self.rot_dim, self.head_dim - self.rot_dim)?;
+        let k_rot = k.narrow(D::Minus1, 0, self.rot_dim)?.contiguous()?;
+        let k_pass = k.narrow(D::Minus1, self.rot_dim, self.head_dim - self.rot_dim)?.contiguous()?;
         let k_rot_embed = apply_rotary_pos_emb(&k_rot, &cos, &sin)?;
         let k = Tensor::cat(&[&k_rot_embed, &k_pass], D::Minus1)?;
 
@@ -412,7 +402,7 @@ impl Attention {
         } else { v };
 
         let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-        let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let attn_weights = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
 
         let kv_seq_len = k.dim(2)?;
         let attn_weights = if seq_len > 1 {
@@ -434,16 +424,16 @@ impl Attention {
         
         attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
         
-        // Gated Attention 拦截
+        // ⭐ 确保 gate 在 reshape 前是连续内存
         if let Some(g) = gate {
-            attn_output = (attn_output * candle_nn::ops::sigmoid(&g.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?))?;
+            let g_flat = g.contiguous()?.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
+            attn_output = (attn_output * candle_nn::ops::sigmoid(&g_flat)?)?;
         }
 
         Ok(self.o_proj.forward(&attn_output)?)
     }
 }
 
-// 统一的 TokenMixer，用枚举将不同架构归一
 enum TokenMixer {
     Softmax(Attention),
     GatedDeltaNet(GatedDeltaNet),
@@ -649,7 +639,6 @@ impl LlmEngine {
             rope_theta: config_dict.get_item("rope_theta")?.map(|v| v.extract().unwrap_or(10000.0)).unwrap_or(10000.0),
             partial_rotary_factor: config_dict.get_item("partial_rotary_factor")?.map(|v| v.extract().unwrap_or(1.0)).unwrap_or(1.0),
             
-            // 安全提取并降级 Hybrid 和 GDN 参数
             attention_type: config_dict.get_item("attention_type")?.map(|v| v.extract().unwrap_or_else(|_| "softmax".to_string())).unwrap_or_else(|| "softmax".to_string()),
             hybrid_ratio: config_dict.get_item("hybrid_ratio")?.map(|v| v.extract().unwrap_or_else(|_| "3:1".to_string())).unwrap_or_else(|| "3:1".to_string()),
             hybrid_softmax_head_dim: config_dict.get_item("hybrid_softmax_head_dim")?.map(|v| v.extract().ok()).flatten(),
@@ -667,7 +656,6 @@ impl LlmEngine {
             }).unwrap_or(false),
         };
 
-        // 动态解析设备参数
         let dev_str = device.to_lowercase();
         let device = if dev_str.starts_with("cuda") {
             let idx = dev_str.split(':').nth(1).unwrap_or("0").parse::<usize>().unwrap_or(0);
@@ -678,7 +666,6 @@ impl LlmEngine {
             Device::Cpu
         };
 
-        // 动态支持 dtype
         let dt = match dtype.to_lowercase().as_str() {
             "fp16" | "float16" => DType::F16,
             "bf16" | "bfloat16" => DType::BF16,
