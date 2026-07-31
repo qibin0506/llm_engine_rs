@@ -8,6 +8,17 @@ use rand::{rngs::StdRng, SeedableRng};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
+pub struct MoEConfig {
+    pub intermediate_size: usize,
+    pub n_routed_experts: usize,
+    pub n_shared_experts: Option<usize>,
+    pub num_experts_per_tok: usize,
+    pub routed_scaling_factor: f32,
+    pub norm_topk_prob: bool,
+    pub n_dense_layer: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Config {
     pub vocab_size: usize,
     pub hidden_size: usize,
@@ -24,8 +35,9 @@ pub struct Config {
     pub lm_head_bias: bool,
     pub rope_theta: f32,
     pub partial_rotary_factor: f32,
+    pub max_position_embeddings: usize,
+    pub moe_config: Option<MoEConfig>,
 
-    // Hybrid & GatedDeltaNet Configs
     pub attention_type: String,
     pub hybrid_ratio: String,
     pub hybrid_softmax_head_dim: Option<usize>,
@@ -58,6 +70,33 @@ fn resolve_layer_type(cfg: &Config, layer_idx: usize) -> LayerType {
         LayerType::GatedDeltaNet
     } else {
         LayerType::Softmax
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct LayerCache {
+    pub kv: Option<(Tensor, Tensor)>,
+    pub recurrent_state: Option<Tensor>,
+    pub conv_q: Option<Tensor>,
+    pub conv_k: Option<Tensor>,
+    pub conv_v: Option<Tensor>,
+}
+
+#[derive(Clone, Default)]
+pub struct KVCache {
+    pub layers: Vec<LayerCache>,
+}
+
+impl KVCache {
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            layers: vec![LayerCache::default(); num_layers],
+        }
+    }
+    pub fn clear(&mut self) {
+        for l in &mut self.layers {
+            *l = LayerCache::default();
+        }
     }
 }
 
@@ -102,64 +141,105 @@ impl Module for RmsNorm {
     }
 }
 
+struct RotaryEmbedding {
+    inv_freq: Tensor,
+}
+
+impl RotaryEmbedding {
+    fn new(cfg: &Config, device: &Device) -> Result<Self> {
+        let dim = (cfg.head_dim as f32 * cfg.partial_rotary_factor) as usize;
+        let theta = cfg.rope_theta;
+        let mut inv_freqs = Vec::with_capacity(dim / 2);
+        for i in (0..dim).step_by(2) {
+            inv_freqs.push(1.0 / theta.powf(i as f32 / dim as f32));
+        }
+        let inv_freq = Tensor::from_vec(inv_freqs, dim / 2, device)?;
+        Ok(Self { inv_freq })
+    }
+
+    fn forward(&self, pos: usize, seq_len: usize, dtype: DType) -> Result<(Tensor, Tensor)> {
+        let device = self.inv_freq.device();
+        let pos_ids = Tensor::arange(pos as u32, (pos + seq_len) as u32, device)?.to_dtype(dtype)?;
+        let freqs = pos_ids.unsqueeze(1)?.matmul(&self.inv_freq.to_dtype(dtype)?.unsqueeze(0)?)?;
+        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
+        let cos = emb.cos()?.reshape((1, 1, seq_len, ()))?;
+        let sin = emb.sin()?.reshape((1, 1, seq_len, ()))?;
+        Ok((cos, sin))
+    }
+}
+
 fn apply_rotary_pos_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let dim = x.dim(D::Minus1)?;
     let half_dim = dim / 2;
-    
-    // ⭐ 保证 narrow 切片后的连续性
-    let x1 = x.narrow(D::Minus1, 0, half_dim)?.contiguous()?;
-    let x2 = x.narrow(D::Minus1, half_dim, half_dim)?.contiguous()?;
+    let x1 = x.narrow(D::Minus1, 0, half_dim)?;
+    let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
 
     let neg_x2 = x2.neg()?;
     let rotated_x = Tensor::cat(&[&neg_x2, &x1], D::Minus1)?;
 
     let x_cos = x.broadcast_mul(cos)?;
     let rot_sin = rotated_x.broadcast_mul(sin)?;
-
     Ok((x_cos + rot_sin)?)
+}
+
+struct CausalMasker {
+    mask: Tensor,
+}
+
+impl CausalMasker {
+    fn new(max_seq_len: usize, device: &Device, dtype: DType) -> Result<Self> {
+        let mut mask_vec = vec![0.0f32; max_seq_len * max_seq_len];
+        for i in 0..max_seq_len {
+            for j in 0..max_seq_len {
+                if j > i {
+                    mask_vec[i * max_seq_len + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let mask = Tensor::from_vec(mask_vec, (max_seq_len, max_seq_len), device)?.to_dtype(dtype)?;
+        Ok(Self { mask })
+    }
+
+    fn get_mask(&self, seq_len: usize, kv_seq_len: usize) -> Result<Tensor> {
+        let pos = kv_seq_len - seq_len;
+        self.mask.narrow(0, 0, seq_len)?.narrow(1, pos, kv_seq_len)?
+            .reshape((1, 1, seq_len, kv_seq_len))
+    }
 }
 
 struct ShortConv {
     conv: candle_nn::Conv1d,
     kernel_size: usize,
-    pub state: Option<Tensor>,
 }
 
 impl ShortConv {
     fn load(d: usize, k: usize, bias: bool, vb: VarBuilder) -> Result<Self> {
-        let cfg = candle_nn::Conv1dConfig {
-            padding: 0,
-            stride: 1,
-            dilation: 1,
-            groups: d,
-        };
+        let cfg = candle_nn::Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: d };
         let conv = if bias {
             candle_nn::conv1d(d, d, k, cfg, vb)?
         } else {
             candle_nn::conv1d_no_bias(d, d, k, cfg, vb)?
         };
-        Ok(Self { conv, kernel_size: k, state: None })
+        Ok(Self { conv, kernel_size: k })
     }
 
-    fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
-        let x_t = x.transpose(1, 2)?.contiguous()?; // [b, d, t]
-        let (out, new_state) = if let Some(prev) = &self.state {
-            let x_cat = Tensor::cat(&[prev, &x_t], D::Minus1)?;
+    fn forward(&self, x: &Tensor, state: &mut Option<Tensor>) -> Result<Tensor> {
+        let x_t = x.transpose(1, 2)?;
+        let (out, new_state) = if let Some(prev) = state {
+            let x_cat = Tensor::cat(&[prev as &Tensor, &x_t], D::Minus1)?;
             let out = self.conv.forward(&x_cat)?;
-            // ⭐ 保证 narrow 切片后的连续性
-            let new_state = x_cat.narrow(D::Minus1, x_cat.dim(D::Minus1)? - (self.kernel_size - 1), self.kernel_size - 1)?.contiguous()?;
+            let new_state = x_cat.narrow(D::Minus1, x_cat.dim(D::Minus1)? - (self.kernel_size - 1), self.kernel_size - 1)?;
             (out, new_state)
         } else {
             let (b, c, _) = x_t.dims3()?;
             let zeros = Tensor::zeros((b, c, self.kernel_size - 1), x_t.dtype(), x_t.device())?;
             let x_padded = Tensor::cat(&[&zeros, &x_t], D::Minus1)?;
             let out = self.conv.forward(&x_padded)?;
-            // ⭐ 保证 narrow 切片后的连续性
-            let new_state = x_padded.narrow(D::Minus1, x_padded.dim(D::Minus1)? - (self.kernel_size - 1), self.kernel_size - 1)?.contiguous()?;
+            let new_state = x_padded.narrow(D::Minus1, x_padded.dim(D::Minus1)? - (self.kernel_size - 1), self.kernel_size - 1)?;
             (out, new_state)
         };
-        self.state = Some(new_state);
-        out.transpose(1, 2)?.contiguous().map_err(E::msg)
+        *state = Some(new_state);
+        out.transpose(1, 2).map_err(E::msg)
     }
 }
 
@@ -179,7 +259,6 @@ struct GatedDeltaNet {
     conv_v: Option<ShortConv>,
     num_heads: usize,
     head_dim: usize,
-    pub recurrent_state: Option<Tensor>,
 }
 
 impl GatedDeltaNet {
@@ -207,11 +286,10 @@ impl GatedDeltaNet {
             conv_v,
             num_heads,
             head_dim,
-            recurrent_state: None,
         })
     }
 
-    fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, cache: &mut LayerCache) -> Result<Tensor> {
         let (b, t, _) = x.dims3()?;
 
         let mut q = self.q_proj.forward(x)?;
@@ -222,9 +300,9 @@ impl GatedDeltaNet {
         let beta = candle_nn::ops::sigmoid(&self.beta_proj.forward(x)?)?;
         let alpha_logits = self.alpha_proj.forward(x)?;
 
-        if let Some(cq) = &mut self.conv_q { q = cq.forward(&q)?; }
-        if let Some(ck) = &mut self.conv_k { k = ck.forward(&k)?; }
-        if let Some(cv) = &mut self.conv_v { v = cv.forward(&v)?; }
+        if let Some(cq) = &self.conv_q { q = cq.forward(&q, &mut cache.conv_q)?; }
+        if let Some(ck) = &self.conv_k { k = ck.forward(&k, &mut cache.conv_k)?; }
+        if let Some(cv) = &self.conv_v { v = cv.forward(&v, &mut cache.conv_v)?; }
 
         let q = candle_nn::ops::silu(&q)?.reshape((b, t, self.num_heads, self.head_dim))?;
         let k = candle_nn::ops::silu(&k)?.reshape((b, t, self.num_heads, self.head_dim))?;
@@ -234,33 +312,32 @@ impl GatedDeltaNet {
         let dt_b = self.dt_bias.reshape((1, 1, self.num_heads))?.broadcast_as((b, t, self.num_heads))?;
         let dt = stable_softplus(&(alpha_logits + dt_b)?)?;
         let a_log_exp = self.a_log.exp()?.reshape((1, 1, self.num_heads))?.broadcast_as((b, t, self.num_heads))?;
-        let g_decay = (dt.neg()? * a_log_exp)?; 
-        let alpha = g_decay.exp()?; 
+        let g_decay = (dt.neg()? * a_log_exp)?;
+        let alpha = g_decay.exp()?;
 
         let q = l2_norm(&q)?;
         let k = l2_norm(&k)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let q = (q * scale)?;
 
-        let mut curr_state = match &self.recurrent_state {
+        let mut curr_state = match &cache.recurrent_state {
             Some(state) => state.clone(),
             None => Tensor::zeros((b, self.num_heads, self.head_dim, self.head_dim), q.dtype(), q.device())?
         };
 
         let mut out_list = Vec::with_capacity(t);
         for i in 0..t {
-            // ⭐ 保证所有循环内 narrow 切片的连续性！
-            let q_i = q.narrow(1, i, 1)?.squeeze(1)?.contiguous()?;
-            let k_i = k.narrow(1, i, 1)?.squeeze(1)?.contiguous()?;
-            let v_i = v.narrow(1, i, 1)?.squeeze(1)?.contiguous()?;
-            let a_i = alpha.narrow(1, i, 1)?.squeeze(1)?.reshape((b, self.num_heads, 1, 1))?.contiguous()?;
-            let b_i = beta.narrow(1, i, 1)?.squeeze(1)?.reshape((b, self.num_heads, 1))?.contiguous()?;
+            let q_i = q.narrow(1, i, 1)?.squeeze(1)?;
+            let k_i = k.narrow(1, i, 1)?.squeeze(1)?;
+            let v_i = v.narrow(1, i, 1)?.squeeze(1)?;
+            let a_i = alpha.narrow(1, i, 1)?.squeeze(1)?.reshape((b, self.num_heads, 1, 1))?;
+            let b_i = beta.narrow(1, i, 1)?.squeeze(1)?.reshape((b, self.num_heads, 1))?;
 
             curr_state = curr_state.broadcast_mul(&a_i)?;
-            
+
             let v_pred = k_i.unsqueeze(2)?.matmul(&curr_state)?.squeeze(2)?;
             let v_err = (v_i - v_pred)?;
-            
+
             let b_v_err = v_err.broadcast_mul(&b_i)?;
             let delta_s = k_i.unsqueeze(3)?.matmul(&b_v_err.unsqueeze(2)?)?;
             curr_state = (curr_state + delta_s)?;
@@ -269,13 +346,13 @@ impl GatedDeltaNet {
             out_list.push(o_i);
         }
 
-        self.recurrent_state = Some(curr_state);
+        cache.recurrent_state = Some(curr_state);
 
         let out = Tensor::stack(&out_list, 1)?;
         let out = self.g_norm.forward(&out)?;
         let out = (out * candle_nn::ops::silu(&g)?)?;
         let out = out.reshape((b, t, self.num_heads * self.head_dim))?;
-        
+
         Ok(self.o_proj.forward(&out)?)
     }
 }
@@ -291,15 +368,13 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     rot_dim: usize,
-    theta: f32,
     is_gated: bool,
-    pub kv_cache: Option<(Tensor, Tensor)>,
 }
 
 impl Attention {
     fn load(cfg: &Config, vb: VarBuilder, layer_idx: usize) -> Result<Self> {
         let is_hybrid_softmax = cfg.attention_type == "hybrid" && resolve_layer_type(cfg, layer_idx) == LayerType::Softmax;
-        
+
         let num_heads = if is_hybrid_softmax { cfg.hybrid_softmax_num_heads.unwrap_or(cfg.num_attention_heads) } else { cfg.num_attention_heads };
         let num_kv_heads = if is_hybrid_softmax { cfg.hybrid_softmax_num_kv_heads.unwrap_or(cfg.num_key_value_heads) } else { cfg.num_key_value_heads };
         let head_dim = if is_hybrid_softmax { cfg.hybrid_softmax_head_dim.unwrap_or(cfg.head_dim) } else { cfg.head_dim };
@@ -320,114 +395,80 @@ impl Attention {
             num_heads,
             num_kv_heads,
             head_dim,
-            rot_dim: (cfg.head_dim as f32 * cfg.partial_rotary_factor) as usize, 
-            theta: cfg.rope_theta,
+            rot_dim: (head_dim as f32 * cfg.partial_rotary_factor) as usize,
             is_gated,
-            kv_cache: None,
         })
     }
 
-    fn forward(&mut self, x: &Tensor, pos: usize) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, cache: &mut LayerCache) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
-        let device = x.device();
 
         let q_out = self.q_proj.forward(x)?;
-        
-        // ⭐ 修复致命 Bug：按各头 reshape 后在最后一个维度切分，并保证连续性！
         let (mut q, gate) = if self.is_gated {
-            let q_out_reshaped = q_out.reshape((b_sz, seq_len, self.num_heads, self.head_dim * 2))?;
-            let q_slice = q_out_reshaped.narrow(D::Minus1, 0, self.head_dim)?.contiguous()?;
-            let gate_slice = q_out_reshaped.narrow(D::Minus1, self.head_dim, self.head_dim)?.contiguous()?;
-            (q_slice, Some(gate_slice))
+            let q_out = q_out.reshape((b_sz, seq_len, self.num_heads, self.head_dim * 2))?;
+            let q = q_out.narrow(D::Minus1, 0, self.head_dim)?;
+            let gate = q_out.narrow(D::Minus1, self.head_dim, self.head_dim)?;
+            (q, Some(gate))
         } else {
             (q_out.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?, None)
         };
 
         let mut k = self.k_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?;
-        let v = self.v_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let mut v = self.v_proj.forward(x)?.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?;
 
         if let Some(norm) = &self.q_norm { q = norm.forward(&q)?; }
         if let Some(norm) = &self.k_norm { k = norm.forward(&k)?; }
 
-        q = q.transpose(1, 2)?.contiguous()?;
-        k = k.transpose(1, 2)?.contiguous()?;
+        q = q.transpose(1, 2)?;
+        k = k.transpose(1, 2)?;
+        v = v.transpose(1, 2)?;
 
-        let mut inv_freqs = Vec::new();
-        for i in (0..self.rot_dim).step_by(2) {
-            inv_freqs.push(1.0 / self.theta.powf(i as f32 / self.rot_dim as f32));
-        }
-        let mut freqs_vec = Vec::new();
-        for p in pos..(pos + seq_len) {
-            for &inv_f in &inv_freqs { freqs_vec.push((p as f32) * inv_f); }
-        }
-        let freqs = Tensor::from_vec(freqs_vec, (seq_len, self.rot_dim / 2), device)?;
-        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
-        let cos = emb.cos()?.reshape((1, 1, seq_len, self.rot_dim))?.to_dtype(x.dtype())?;
-        let sin = emb.sin()?.reshape((1, 1, seq_len, self.rot_dim))?.to_dtype(x.dtype())?;
-
-        let q_rot = q.narrow(D::Minus1, 0, self.rot_dim)?.contiguous()?;
-        let q_pass = q.narrow(D::Minus1, self.rot_dim, self.head_dim - self.rot_dim)?.contiguous()?;
-        let q_rot_embed = apply_rotary_pos_emb(&q_rot, &cos, &sin)?;
+        let q_rot = q.narrow(D::Minus1, 0, self.rot_dim)?;
+        let q_pass = q.narrow(D::Minus1, self.rot_dim, self.head_dim - self.rot_dim)?;
+        let q_rot_embed = apply_rotary_pos_emb(&q_rot, cos, sin)?;
         let q = Tensor::cat(&[&q_rot_embed, &q_pass], D::Minus1)?;
 
-        let k_rot = k.narrow(D::Minus1, 0, self.rot_dim)?.contiguous()?;
-        let k_pass = k.narrow(D::Minus1, self.rot_dim, self.head_dim - self.rot_dim)?.contiguous()?;
-        let k_rot_embed = apply_rotary_pos_emb(&k_rot, &cos, &sin)?;
+        let k_rot = k.narrow(D::Minus1, 0, self.rot_dim)?;
+        let k_pass = k.narrow(D::Minus1, self.rot_dim, self.head_dim - self.rot_dim)?;
+        let k_rot_embed = apply_rotary_pos_emb(&k_rot, cos, sin)?;
         let k = Tensor::cat(&[&k_rot_embed, &k_pass], D::Minus1)?;
 
-        let (k, v) = match &self.kv_cache {
+        let (k, v) = match &cache.kv {
             Some((prev_k, prev_v)) => {
-                let new_k = Tensor::cat(&[prev_k, &k], 2)?;
-                let new_v = Tensor::cat(&[prev_v, &v], 2)?;
+                let new_k = Tensor::cat(&[prev_k as &Tensor, &k], 2)?;
+                let new_v = Tensor::cat(&[prev_v as &Tensor, &v], 2)?;
                 (new_k, new_v)
             }
             None => (k, v),
         };
-        self.kv_cache = Some((k.clone(), v.clone()));
+        cache.kv = Some((k.clone(), v.clone()));
 
         let k = if self.num_heads != self.num_kv_heads {
             let repeat = self.num_heads / self.num_kv_heads;
             let (b, _kv_heads, s_len, d) = k.dims4()?;
-            k.unsqueeze(2)?
-             .repeat((1, 1, repeat, 1, 1))?
-             .reshape((b, self.num_heads, s_len, d))?
+            k.unsqueeze(2)?.repeat((1, 1, repeat, 1, 1))?.reshape((b, self.num_heads, s_len, d))?
         } else { k };
 
         let v = if self.num_heads != self.num_kv_heads {
             let repeat = self.num_heads / self.num_kv_heads;
             let (b, _kv_heads, s_len, d) = v.dims4()?;
-            v.unsqueeze(2)?
-             .repeat((1, 1, repeat, 1, 1))?
-             .reshape((b, self.num_heads, s_len, d))?
+            v.unsqueeze(2)?.repeat((1, 1, repeat, 1, 1))?.reshape((b, self.num_heads, s_len, d))?
         } else { v };
 
         let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-        let attn_weights = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
+        let mut attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
-        let kv_seq_len = k.dim(2)?;
-        let attn_weights = if seq_len > 1 {
-            let mask: Vec<_> = (0..seq_len).flat_map(|i| {
-                (0..kv_seq_len).map(move |j| {
-                    if j > i + pos { f32::NEG_INFINITY } else { 0f32 }
-                })
-            }).collect();
-            let mask = Tensor::from_vec(mask, (seq_len, kv_seq_len), device)?
-                       .reshape((1, 1, seq_len, kv_seq_len))?
-                       .to_dtype(attn_weights.dtype())?;
-            attn_weights.broadcast_add(&mask)?
-        } else {
-            attn_weights
-        };
+        if let Some(m) = mask {
+            attn_weights = attn_weights.broadcast_add(m)?;
+        }
 
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
         let mut attn_output = attn_weights.matmul(&v)?;
-        
+
         attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
-        
-        // ⭐ 确保 gate 在 reshape 前是连续内存
+
         if let Some(g) = gate {
-            let g_flat = g.contiguous()?.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
-            attn_output = (attn_output * candle_nn::ops::sigmoid(&g_flat)?)?;
+            attn_output = (attn_output * candle_nn::ops::sigmoid(&g.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?))?;
         }
 
         Ok(self.o_proj.forward(&attn_output)?)
@@ -447,22 +488,10 @@ impl TokenMixer {
         }
     }
 
-    fn forward(&mut self, x: &Tensor, pos: usize) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, cache: &mut LayerCache) -> Result<Tensor> {
         match self {
-            Self::Softmax(attn) => attn.forward(x, pos),
-            Self::GatedDeltaNet(gdn) => gdn.forward(x),
-        }
-    }
-
-    fn clear_cache(&mut self) {
-        match self {
-            Self::Softmax(attn) => attn.kv_cache = None,
-            Self::GatedDeltaNet(gdn) => {
-                gdn.recurrent_state = None;
-                if let Some(cq) = &mut gdn.conv_q { cq.state = None; }
-                if let Some(ck) = &mut gdn.conv_k { ck.state = None; }
-                if let Some(cv) = &mut gdn.conv_v { cv.state = None; }
-            }
+            Self::Softmax(attn) => attn.forward(x, cos, sin, mask, cache),
+            Self::GatedDeltaNet(gdn) => gdn.forward(x, cache), // GatedDeltaNet does not need rope/mask for standard recurrence
         }
     }
 }
@@ -474,11 +503,12 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn load(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &Config, vb: VarBuilder, intermediate_size: Option<usize>) -> Result<Self> {
+        let int_size = intermediate_size.unwrap_or(cfg.intermediate_size);
         Ok(Self {
-            gate_proj: get_linear(cfg.hidden_size, cfg.intermediate_size, cfg.mlp_bias, vb.pp("gate_proj"))?,
-            up_proj: get_linear(cfg.hidden_size, cfg.intermediate_size, cfg.mlp_bias, vb.pp("up_proj"))?,
-            down_proj: get_linear(cfg.intermediate_size, cfg.hidden_size, cfg.mlp_bias, vb.pp("down_proj"))?,
+            gate_proj: get_linear(cfg.hidden_size, int_size, cfg.mlp_bias, vb.pp("gate_proj"))?,
+            up_proj: get_linear(cfg.hidden_size, int_size, cfg.mlp_bias, vb.pp("up_proj"))?,
+            down_proj: get_linear(int_size, cfg.hidden_size, cfg.mlp_bias, vb.pp("down_proj"))?,
         })
     }
 }
@@ -487,32 +517,156 @@ impl Module for Mlp {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let act = (gate.clone() * candle_nn::ops::silu(&gate)?)?;
-        self.down_proj.forward(&(act * up)?)
+        let silu_gate = candle_nn::ops::silu(&gate)?;
+        self.down_proj.forward(&(silu_gate * up)?)
+    }
+}
+
+fn topk_2d(t: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
+    let (b, _) = t.dims2()?;
+    let t_f32 = t.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    let mut topk_vals = Vec::with_capacity(b * k);
+    let mut topk_ids = Vec::with_capacity(b * k);
+
+    for row in t_f32.iter() {
+        let mut indexed: Vec<(usize, &f32)> = row.iter().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for i in 0..k {
+            topk_vals.push(*indexed[i].1);
+            topk_ids.push(indexed[i].0 as u32);
+        }
+    }
+    let vals = Tensor::from_vec(topk_vals, (b, k), t.device())?.to_dtype(t.dtype())?;
+    let ids = Tensor::from_vec(topk_ids, (b, k), t.device())?;
+    Ok((vals, ids))
+}
+
+struct MoE {
+    experts: Vec<Mlp>,
+    shared_experts: Option<Mlp>,
+    gate_weight: Tensor,
+    top_k: usize,
+    n_routed_experts: usize,
+    routed_scaling_factor: f32,
+    norm_topk_prob: bool,
+}
+
+impl MoE {
+    fn load(cfg: &Config, moe_cfg: &MoEConfig, vb: VarBuilder) -> Result<Self> {
+        let mut experts = Vec::new();
+        for i in 0..moe_cfg.n_routed_experts {
+            experts.push(Mlp::load(cfg, vb.pp(format!("experts.{}", i)), Some(moe_cfg.intermediate_size))?);
+        }
+        
+        let shared_experts = if let Some(n_shared) = moe_cfg.n_shared_experts {
+            let shared_size = moe_cfg.intermediate_size * n_shared;
+            Some(Mlp::load(cfg, vb.pp("shared_experts"), Some(shared_size))?)
+        } else {
+            None
+        };
+        
+        let gate_weight = vb.get((moe_cfg.n_routed_experts, cfg.hidden_size), "gate.weight")?;
+        
+        Ok(Self {
+            experts,
+            shared_experts,
+            gate_weight,
+            top_k: moe_cfg.num_experts_per_tok,
+            n_routed_experts: moe_cfg.n_routed_experts,
+            routed_scaling_factor: moe_cfg.routed_scaling_factor,
+            norm_topk_prob: moe_cfg.norm_topk_prob,
+        })
+    }
+    
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, s, h) = x.dims3()?;
+        let x_flat = x.reshape((b * s, h))?;
+        
+        let logits = x_flat.to_dtype(DType::F32)?.matmul(&self.gate_weight.t()?.to_dtype(DType::F32)?)?;
+        let scores = candle_nn::ops::softmax(&logits, D::Minus1)?;
+        let (mut topk_weights, topk_ids) = topk_2d(&scores, self.top_k)?;
+        
+        if self.norm_topk_prob && self.top_k > 1 {
+            let sum = topk_weights.sum_keepdim(D::Minus1)?;
+            topk_weights = topk_weights.broadcast_div(&sum)?;
+        }
+        topk_weights = (topk_weights * self.routed_scaling_factor as f64)?;
+        
+        let mut out_tokens = Vec::with_capacity(b * s);
+        let x_split = x_flat.chunk(b * s, 0)?; 
+        let ids_split = topk_ids.chunk(b * s, 0)?;
+        let weights_split = topk_weights.chunk(b * s, 0)?;
+        
+        for (i, token) in x_split.iter().enumerate() {
+            let ids = ids_split[i].to_vec1::<u32>()?;
+            let weights = weights_split[i].to_vec1::<f32>()?;
+            
+            let mut combined_out = token.zeros_like()?;
+            for j in 0..self.top_k {
+                let exp_idx = ids[j] as usize;
+                let exp_out = self.experts[exp_idx].forward(token)?;
+                combined_out = (combined_out + (exp_out * weights[j] as f64)?)?;
+            }
+            out_tokens.push(combined_out);
+        }
+        
+        let mut out = Tensor::cat(&out_tokens, 0)?; 
+        
+        if let Some(shared) = &self.shared_experts {
+            out = (out + shared.forward(&x_flat)?)?;
+        }
+        
+        Ok(out.reshape((b, s, h))?)
+    }
+}
+
+enum FeedForward {
+    Mlp(Mlp),
+    MoE(MoE),
+}
+
+impl FeedForward {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Mlp(mlp) => mlp.forward(x),
+            Self::MoE(moe) => moe.forward(x),
+        }
     }
 }
 
 struct DecoderLayer {
     pub mixer: TokenMixer,
-    mlp: Mlp,
+    mlp: FeedForward,
     attn_norm: RmsNorm,
     mlp_norm: RmsNorm,
 }
 
 impl DecoderLayer {
     fn load(cfg: &Config, vb: VarBuilder, layer_idx: usize) -> Result<Self> {
+        let use_moe = if let Some(moe_cfg) = &cfg.moe_config {
+            moe_cfg.n_dense_layer.map_or(true, |n| layer_idx >= n)
+        } else {
+            false
+        };
+
+        let mlp = if use_moe {
+            FeedForward::MoE(MoE::load(cfg, cfg.moe_config.as_ref().unwrap(), vb.pp("mlp"))?)
+        } else {
+            FeedForward::Mlp(Mlp::load(cfg, vb.pp("mlp"), None)?)
+        };
+
         Ok(Self {
             mixer: TokenMixer::load(cfg, vb.pp("attn"), layer_idx)?,
-            mlp: Mlp::load(cfg, vb.pp("mlp"))?,
+            mlp,
             attn_norm: RmsNorm::load(cfg.hidden_size, cfg.norm_eps, vb.pp("attn_norm"))?,
             mlp_norm: RmsNorm::load(cfg.hidden_size, cfg.norm_eps, vb.pp("mlp_norm"))?,
         })
     }
 
-    fn forward(&mut self, x: &Tensor, pos: usize) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, pos: usize, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, cache: &mut LayerCache) -> Result<Tensor> {
         let residual = x.clone();
         let x = self.attn_norm.forward(x)?;
-        let x = self.mixer.forward(&x, pos)?;
+        let x = self.mixer.forward(&x, cos, sin, mask, cache)?;
         let x = (x + residual)?;
 
         let residual = x.clone();
@@ -527,10 +681,12 @@ struct LlmModel {
     pub layers: Vec<DecoderLayer>,
     head_norm: RmsNorm,
     lm_head: Linear,
+    rotary_emb: RotaryEmbedding,
+    causal_masker: CausalMasker,
 }
 
 impl LlmModel {
-    fn load(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &Config, vb: VarBuilder, device: &Device, dtype: DType) -> Result<Self> {
         let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
         let mut layers = Vec::new();
         for i in 0..cfg.num_hidden_layers {
@@ -543,14 +699,28 @@ impl LlmModel {
         } else {
             Linear::new(embed_tokens.embeddings().clone(), None)
         };
+        
+        let rotary_emb = RotaryEmbedding::new(cfg, device)?;
+        let causal_masker = CausalMasker::new(cfg.max_position_embeddings, device, dtype)?;
 
-        Ok(Self { embed_tokens, layers, head_norm, lm_head })
+        Ok(Self { embed_tokens, layers, head_norm, lm_head, rotary_emb, causal_masker })
     }
 
-    fn forward(&mut self, input_ids: &Tensor, pos: usize) -> Result<Tensor> {
+    fn forward(&self, input_ids: &Tensor, pos: usize, kv_cache: &mut KVCache) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?;
-        for layer in &mut self.layers {
-            x = layer.forward(&x, pos)?;
+        let seq_len = x.dim(1)?;
+        let kv_seq_len = pos + seq_len;
+        
+        let (cos, sin) = self.rotary_emb.forward(pos, seq_len, x.dtype())?;
+        
+        let mask = if seq_len > 1 {
+            Some(self.causal_masker.get_mask(seq_len, kv_seq_len)?)
+        } else {
+            None
+        };
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward(&x, pos, &cos, &sin, mask.as_ref(), &mut kv_cache.layers[i])?;
         }
         let x = self.head_norm.forward(&x)?;
         let x = x.i((.., x.dim(1)? - 1, ..))?;
@@ -611,6 +781,7 @@ fn sample_logits(
 pub struct LlmEngine {
     model: LlmModel,
     device: Device,
+    kv_cache: KVCache,
 }
 
 #[pymethods]
@@ -618,6 +789,19 @@ impl LlmEngine {
     #[new]
     #[pyo3(signature = (weights_path, config_dict, dtype="fp32", device="cpu"))]
     pub fn new(weights_path: &str, config_dict: &Bound<'_, PyDict>, dtype: &str, device: &str) -> PyResult<Self> {
+        
+        let moe_config = if let Ok(Some(moe)) = config_dict.get_item("moe_config") {
+            Some(MoEConfig {
+                intermediate_size: moe.getattr("intermediate_size")?.extract()?,
+                n_routed_experts: moe.getattr("n_routed_experts")?.extract()?,
+                n_shared_experts: moe.getattr("n_shared_experts")?.extract().ok(),
+                num_experts_per_tok: moe.getattr("num_experts_per_tok")?.extract()?,
+                routed_scaling_factor: moe.getattr("routed_scaling_factor")?.extract().unwrap_or(1.0),
+                norm_topk_prob: moe.getattr("norm_topk_prob")?.extract().unwrap_or(false),
+                n_dense_layer: moe.getattr("n_dense_layer")?.extract().ok(),
+            })
+        } else { None };
+        
         let cfg = Config {
             vocab_size: config_dict.get_item("vocab_size")?.expect("Missing vocab_size").extract()?,
             hidden_size: config_dict.get_item("hidden_size")?.expect("Missing hidden_size").extract()?,
@@ -638,7 +822,9 @@ impl LlmEngine {
             lm_head_bias: config_dict.get_item("lm_head_bias")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
             rope_theta: config_dict.get_item("rope_theta")?.map(|v| v.extract().unwrap_or(10000.0)).unwrap_or(10000.0),
             partial_rotary_factor: config_dict.get_item("partial_rotary_factor")?.map(|v| v.extract().unwrap_or(1.0)).unwrap_or(1.0),
-            
+            max_position_embeddings: config_dict.get_item("max_position_embeddings")?.map(|v| v.extract().unwrap_or(4096)).unwrap_or(4096),
+            moe_config,
+
             attention_type: config_dict.get_item("attention_type")?.map(|v| v.extract().unwrap_or_else(|_| "softmax".to_string())).unwrap_or_else(|| "softmax".to_string()),
             hybrid_ratio: config_dict.get_item("hybrid_ratio")?.map(|v| v.extract().unwrap_or_else(|_| "3:1".to_string())).unwrap_or_else(|| "3:1".to_string()),
             hybrid_softmax_head_dim: config_dict.get_item("hybrid_softmax_head_dim")?.map(|v| v.extract().ok()).flatten(),
@@ -673,15 +859,15 @@ impl LlmEngine {
         };
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dt, &device).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))? };
-        let model = LlmModel::load(&cfg, vb).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let model = LlmModel::load(&cfg, vb, &device, dt).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        Ok(Self { model, device })
+        let kv_cache = KVCache::new(cfg.num_hidden_layers);
+
+        Ok(Self { model, device, kv_cache })
     }
 
     pub fn clear_kv_cache(&mut self) {
-        for layer in &mut self.model.layers {
-            layer.mixer.clear_cache();
-        }
+        self.kv_cache.clear();
     }
 
     #[pyo3(signature = (input_ids, max_new_tokens, temperature=1.0, top_k=None, top_p=None, repetition_penalty=1.0, exclude_penalty_tokens=None, suppress_tokens=None, eos_token_id=2, seed=42))]
@@ -718,7 +904,7 @@ impl LlmEngine {
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-            let logits_tensor = self.model.forward(&input_tensor, current_pos)
+            let logits_tensor = self.model.forward(&input_tensor, current_pos, &mut self.kv_cache)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
             let mut logits = logits_tensor
@@ -836,7 +1022,7 @@ impl LlmStreamer {
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-            let logits_tensor = engine.model.forward(&input_tensor, slf.current_pos)
+            let logits_tensor = engine.model.forward(&input_tensor, slf.current_pos, &mut engine.kv_cache)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
             logits_tensor
