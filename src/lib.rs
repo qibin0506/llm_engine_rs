@@ -202,8 +202,8 @@ impl CausalMasker {
 
     fn get_mask(&self, seq_len: usize, kv_seq_len: usize) -> Result<Tensor> {
         let pos = kv_seq_len - seq_len;
-        self.mask.narrow(0, 0, seq_len)?.narrow(1, pos, kv_seq_len)?
-            .reshape((1, 1, seq_len, kv_seq_len))
+        Ok(self.mask.narrow(0, 0, seq_len)?.narrow(1, pos, kv_seq_len)?
+            .reshape((1, 1, seq_len, kv_seq_len))?)
     }
 }
 
@@ -557,16 +557,16 @@ impl MoE {
         for i in 0..moe_cfg.n_routed_experts {
             experts.push(Mlp::load(cfg, vb.pp(format!("experts.{}", i)), Some(moe_cfg.intermediate_size))?);
         }
-        
+
         let shared_experts = if let Some(n_shared) = moe_cfg.n_shared_experts {
             let shared_size = moe_cfg.intermediate_size * n_shared;
             Some(Mlp::load(cfg, vb.pp("shared_experts"), Some(shared_size))?)
         } else {
             None
         };
-        
+
         let gate_weight = vb.get((moe_cfg.n_routed_experts, cfg.hidden_size), "gate.weight")?;
-        
+
         Ok(Self {
             experts,
             shared_experts,
@@ -577,30 +577,30 @@ impl MoE {
             norm_topk_prob: moe_cfg.norm_topk_prob,
         })
     }
-    
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (b, s, h) = x.dims3()?;
         let x_flat = x.reshape((b * s, h))?;
-        
+
         let logits = x_flat.to_dtype(DType::F32)?.matmul(&self.gate_weight.t()?.to_dtype(DType::F32)?)?;
         let scores = candle_nn::ops::softmax(&logits, D::Minus1)?;
         let (mut topk_weights, topk_ids) = topk_2d(&scores, self.top_k)?;
-        
+
         if self.norm_topk_prob && self.top_k > 1 {
             let sum = topk_weights.sum_keepdim(D::Minus1)?;
             topk_weights = topk_weights.broadcast_div(&sum)?;
         }
         topk_weights = (topk_weights * self.routed_scaling_factor as f64)?;
-        
+
         let mut out_tokens = Vec::with_capacity(b * s);
-        let x_split = x_flat.chunk(b * s, 0)?; 
+        let x_split = x_flat.chunk(b * s, 0)?;
         let ids_split = topk_ids.chunk(b * s, 0)?;
         let weights_split = topk_weights.chunk(b * s, 0)?;
-        
+
         for (i, token) in x_split.iter().enumerate() {
             let ids = ids_split[i].to_vec1::<u32>()?;
             let weights = weights_split[i].to_vec1::<f32>()?;
-            
+
             let mut combined_out = token.zeros_like()?;
             for j in 0..self.top_k {
                 let exp_idx = ids[j] as usize;
@@ -609,13 +609,13 @@ impl MoE {
             }
             out_tokens.push(combined_out);
         }
-        
-        let mut out = Tensor::cat(&out_tokens, 0)?; 
-        
+
+        let mut out = Tensor::cat(&out_tokens, 0)?;
+
         if let Some(shared) = &self.shared_experts {
             out = (out + shared.forward(&x_flat)?)?;
         }
-        
+
         Ok(out.reshape((b, s, h))?)
     }
 }
@@ -628,7 +628,7 @@ enum FeedForward {
 impl FeedForward {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Mlp(mlp) => mlp.forward(x),
+            Self::Mlp(mlp) => Ok(mlp.forward(x)?),
             Self::MoE(moe) => moe.forward(x),
         }
     }
@@ -663,7 +663,7 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, pos: usize, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, cache: &mut LayerCache) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, _pos: usize, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, cache: &mut LayerCache) -> Result<Tensor> {
         let residual = x.clone();
         let x = self.attn_norm.forward(x)?;
         let x = self.mixer.forward(&x, cos, sin, mask, cache)?;
@@ -699,7 +699,7 @@ impl LlmModel {
         } else {
             Linear::new(embed_tokens.embeddings().clone(), None)
         };
-        
+
         let rotary_emb = RotaryEmbedding::new(cfg, device)?;
         let causal_masker = CausalMasker::new(cfg.max_position_embeddings, device, dtype)?;
 
@@ -710,9 +710,9 @@ impl LlmModel {
         let mut x = self.embed_tokens.forward(input_ids)?;
         let seq_len = x.dim(1)?;
         let kv_seq_len = pos + seq_len;
-        
+
         let (cos, sin) = self.rotary_emb.forward(pos, seq_len, x.dtype())?;
-        
+
         let mask = if seq_len > 1 {
             Some(self.causal_masker.get_mask(seq_len, kv_seq_len)?)
         } else {
@@ -789,7 +789,7 @@ impl LlmEngine {
     #[new]
     #[pyo3(signature = (weights_path, config_dict, dtype="fp32", device="cpu"))]
     pub fn new(weights_path: &str, config_dict: &Bound<'_, PyDict>, dtype: &str, device: &str) -> PyResult<Self> {
-        
+
         let moe_config = if let Ok(Some(moe)) = config_dict.get_item("moe_config") {
             Some(MoEConfig {
                 intermediate_size: moe.getattr("intermediate_size")?.extract()?,
@@ -801,7 +801,7 @@ impl LlmEngine {
                 n_dense_layer: moe.getattr("n_dense_layer")?.extract().ok(),
             })
         } else { None };
-        
+
         let cfg = Config {
             vocab_size: config_dict.get_item("vocab_size")?.expect("Missing vocab_size").extract()?,
             hidden_size: config_dict.get_item("hidden_size")?.expect("Missing hidden_size").extract()?,
@@ -1016,7 +1016,8 @@ impl LlmStreamer {
         }
 
         let mut logits = {
-            let mut engine = slf.engine.borrow_mut(py);
+            let mut engine_py = slf.engine.borrow_mut(py);
+            let engine = &mut *engine_py;
 
             let input_tensor = Tensor::new(slf.current_input.as_slice(), &engine.device)
                 .and_then(|t| t.unsqueeze(0))
@@ -1031,6 +1032,7 @@ impl LlmStreamer {
                 .and_then(|t| t.to_vec1::<f32>())
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
         };
+
 
         for &token in &slf.suppress_tokens {
             if (token as usize) < logits.len() {
