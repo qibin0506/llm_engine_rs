@@ -395,7 +395,7 @@ impl Attention {
             num_heads,
             num_kv_heads,
             head_dim,
-            rot_dim: (head_dim as f32 * cfg.partial_rotary_factor) as usize,
+            rot_dim: (cfg.head_dim as f32 * cfg.partial_rotary_factor) as usize,
             is_gated,
         })
     }
