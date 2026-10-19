@@ -147,7 +147,12 @@ struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     fn new(cfg: &Config, device: &Device) -> Result<Self> {
-        let dim = (cfg.head_dim as f32 * cfg.partial_rotary_factor) as usize;
+        let rope_head_dim = if cfg.attention_type == "hybrid" {
+            cfg.hybrid_softmax_head_dim.unwrap_or(cfg.head_dim)
+        } else {
+            cfg.head_dim
+        };
+        let dim = (rope_head_dim as f32 * cfg.partial_rotary_factor) as usize;
         let theta = cfg.rope_theta;
         let mut inv_freqs = Vec::with_capacity(dim / 2);
         for i in (0..dim).step_by(2) {
@@ -202,7 +207,7 @@ impl CausalMasker {
 
     fn get_mask(&self, seq_len: usize, kv_seq_len: usize) -> Result<Tensor> {
         let pos = kv_seq_len - seq_len;
-        Ok(self.mask.narrow(0, 0, seq_len)?.narrow(1, pos, kv_seq_len)?
+        Ok(self.mask.narrow(0, pos, seq_len)?.narrow(1, 0, kv_seq_len)?
             .reshape((1, 1, seq_len, kv_seq_len))?)
     }
 }
@@ -395,7 +400,7 @@ impl Attention {
             num_heads,
             num_kv_heads,
             head_dim,
-            rot_dim: (cfg.head_dim as f32 * cfg.partial_rotary_factor) as usize,
+            rot_dim: (head_dim as f32 * cfg.partial_rotary_factor) as usize,
             is_gated,
         })
     }
@@ -784,6 +789,27 @@ pub struct LlmEngine {
     kv_cache: KVCache,
 }
 
+fn get_field<'py, T>(obj: &Bound<'py, PyAny>, key: &str) -> Option<T>
+where
+    for<'a> T: FromPyObject<'a, 'py>,
+{
+    if let Ok(item) = obj.get_item(key) {
+        if !item.is_none() {
+            if let Ok(val) = item.extract::<T>() {
+                return Some(val);
+            }
+        }
+    }
+    if let Ok(attr) = obj.getattr(key) {
+        if !attr.is_none() {
+            if let Ok(val) = attr.extract::<T>() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
 #[pymethods]
 impl LlmEngine {
     #[new]
@@ -791,55 +817,100 @@ impl LlmEngine {
     pub fn new(weights_path: &str, config_dict: &Bound<'_, PyDict>, dtype: &str, device: &str) -> PyResult<Self> {
 
         let moe_config = if let Ok(Some(moe)) = config_dict.get_item("moe_config") {
-            Some(MoEConfig {
-                intermediate_size: moe.getattr("intermediate_size")?.extract()?,
-                n_routed_experts: moe.getattr("n_routed_experts")?.extract()?,
-                n_shared_experts: moe.getattr("n_shared_experts")?.extract().ok(),
-                num_experts_per_tok: moe.getattr("num_experts_per_tok")?.extract()?,
-                routed_scaling_factor: moe.getattr("routed_scaling_factor")?.extract().unwrap_or(1.0),
-                norm_topk_prob: moe.getattr("norm_topk_prob")?.extract().unwrap_or(false),
-                n_dense_layer: moe.getattr("n_dense_layer")?.extract().ok(),
-            })
-        } else { None };
+            if !moe.is_none() {
+                let intermediate_size = get_field::<usize>(&moe, "intermediate_size");
+                let n_routed_experts = get_field::<usize>(&moe, "n_routed_experts");
+                let num_experts_per_tok = get_field::<usize>(&moe, "num_experts_per_tok");
+
+                if let (Some(intermediate_size), Some(n_routed_experts), Some(num_experts_per_tok)) = (intermediate_size, n_routed_experts, num_experts_per_tok) {
+                    let n_shared_experts = get_field::<usize>(&moe, "n_shared_experts");
+                    let routed_scaling_factor = get_field::<f32>(&moe, "routed_scaling_factor").unwrap_or(1.0);
+                    let norm_topk_prob = get_field::<bool>(&moe, "norm_topk_prob").unwrap_or(false);
+                    let n_dense_layer = get_field::<usize>(&moe, "n_dense_layer");
+
+                    Some(MoEConfig {
+                        intermediate_size,
+                        n_routed_experts,
+                        n_shared_experts,
+                        num_experts_per_tok,
+                        routed_scaling_factor,
+                        norm_topk_prob,
+                        n_dense_layer,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let vocab_size: usize = config_dict.get_item("vocab_size")?.expect("Missing vocab_size").extract()?;
+        let hidden_size: usize = config_dict.get_item("hidden_size")?.expect("Missing hidden_size").extract()?;
+        let intermediate_size: usize = config_dict.get_item("intermediate_size")?.expect("Missing intermediate_size").extract()?;
+        let num_hidden_layers: usize = config_dict.get_item("num_hidden_layers")?.expect("Missing num_hidden_layers").extract()?;
+        let num_attention_heads: usize = config_dict.get_item("num_attention_heads")?.expect("Missing num_attention_heads").extract()?;
+
+        let num_key_value_heads: usize = config_dict.get_item("num_key_value_heads")?
+            .and_then(|v| v.extract().ok())
+            .unwrap_or(num_attention_heads);
+
+        let head_dim: usize = config_dict.get_item("head_dim")?
+            .and_then(|v| v.extract().ok())
+            .unwrap_or_else(|| hidden_size / num_attention_heads);
+
+        let rope_obj = config_dict.get_item("rope_config")?.filter(|v| !v.is_none());
+        let rope_theta: f32 = rope_obj.as_ref()
+            .and_then(|r| get_field::<f32>(r, "rope_theta"))
+            .or_else(|| config_dict.get_item("rope_theta").ok().flatten().and_then(|v| v.extract().ok()))
+            .unwrap_or(10000.0);
+
+        let partial_rotary_factor: f32 = rope_obj.as_ref()
+            .and_then(|r| get_field::<f32>(r, "partial_rotary_factor"))
+            .or_else(|| config_dict.get_item("partial_rotary_factor").ok().flatten().and_then(|v| v.extract().ok()))
+            .unwrap_or(1.0);
+
+        let gd_obj = config_dict.get_item("gated_deltanet_config")?.filter(|v| !v.is_none());
+        let gated_deltanet_use_short_conv: bool = gd_obj.as_ref()
+            .and_then(|v| get_field::<bool>(v, "use_short_conv"))
+            .unwrap_or(true);
+        let gated_deltanet_conv_kernel_size: usize = gd_obj.as_ref()
+            .and_then(|v| get_field::<usize>(v, "conv_kernel_size"))
+            .unwrap_or(4);
+        let gated_deltanet_conv_bias: bool = gd_obj.as_ref()
+            .and_then(|v| get_field::<bool>(v, "conv_bias"))
+            .unwrap_or(false);
 
         let cfg = Config {
-            vocab_size: config_dict.get_item("vocab_size")?.expect("Missing vocab_size").extract()?,
-            hidden_size: config_dict.get_item("hidden_size")?.expect("Missing hidden_size").extract()?,
-            intermediate_size: config_dict.get_item("intermediate_size")?.expect("Missing intermediate_size").extract()?,
-            num_hidden_layers: config_dict.get_item("num_hidden_layers")?.expect("Missing num_hidden_layers").extract()?,
-            num_attention_heads: config_dict.get_item("num_attention_heads")?.expect("Missing num_attention_heads").extract()?,
-            num_key_value_heads: config_dict.get_item("num_key_value_heads")?.map(|v| v.extract().unwrap()).unwrap_or_else(|| config_dict.get_item("num_attention_heads").unwrap().unwrap().extract().unwrap()),
-            head_dim: config_dict.get_item("head_dim")?.map(|v| v.extract().unwrap()).unwrap_or_else(|| {
-                let h: usize = config_dict.get_item("hidden_size").unwrap().unwrap().extract().unwrap();
-                let n: usize = config_dict.get_item("num_attention_heads").unwrap().unwrap().extract().unwrap();
-                h / n
-            }),
-            norm_eps: config_dict.get_item("norm_eps")?.map(|v| v.extract().unwrap_or(1e-6)).unwrap_or(1e-6),
-            use_qk_norm: config_dict.get_item("use_qk_norm")?.map(|v| v.extract().unwrap_or(true)).unwrap_or(true),
-            attention_qkv_bias: config_dict.get_item("attention_qkv_bias")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
-            attention_out_bias: config_dict.get_item("attention_out_bias")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
-            mlp_bias: config_dict.get_item("mlp_bias")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
-            lm_head_bias: config_dict.get_item("lm_head_bias")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
-            rope_theta: config_dict.get_item("rope_theta")?.map(|v| v.extract().unwrap_or(10000.0)).unwrap_or(10000.0),
-            partial_rotary_factor: config_dict.get_item("partial_rotary_factor")?.map(|v| v.extract().unwrap_or(1.0)).unwrap_or(1.0),
-            max_position_embeddings: config_dict.get_item("max_position_embeddings")?.map(|v| v.extract().unwrap_or(4096)).unwrap_or(4096),
+            vocab_size,
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            norm_eps: config_dict.get_item("norm_eps")?.and_then(|v| v.extract().ok()).unwrap_or(1e-6),
+            use_qk_norm: config_dict.get_item("use_qk_norm")?.and_then(|v| v.extract().ok()).unwrap_or(true),
+            attention_qkv_bias: config_dict.get_item("attention_qkv_bias")?.and_then(|v| v.extract().ok()).unwrap_or(false),
+            attention_out_bias: config_dict.get_item("attention_out_bias")?.and_then(|v| v.extract().ok()).unwrap_or(false),
+            mlp_bias: config_dict.get_item("mlp_bias")?.and_then(|v| v.extract().ok()).unwrap_or(false),
+            lm_head_bias: config_dict.get_item("lm_head_bias")?.and_then(|v| v.extract().ok()).unwrap_or(false),
+            rope_theta,
+            partial_rotary_factor,
+            max_position_embeddings: config_dict.get_item("max_position_embeddings")?.and_then(|v| v.extract().ok()).unwrap_or(4096),
             moe_config,
 
-            attention_type: config_dict.get_item("attention_type")?.map(|v| v.extract().unwrap_or_else(|_| "softmax".to_string())).unwrap_or_else(|| "softmax".to_string()),
-            hybrid_ratio: config_dict.get_item("hybrid_ratio")?.map(|v| v.extract().unwrap_or_else(|_| "3:1".to_string())).unwrap_or_else(|| "3:1".to_string()),
-            hybrid_softmax_head_dim: config_dict.get_item("hybrid_softmax_head_dim")?.map(|v| v.extract().ok()).flatten(),
-            hybrid_softmax_num_heads: config_dict.get_item("hybrid_softmax_num_heads")?.map(|v| v.extract().ok()).flatten(),
-            hybrid_softmax_num_kv_heads: config_dict.get_item("hybrid_softmax_num_kv_heads")?.map(|v| v.extract().ok()).flatten(),
-            hybrid_softmax_gated: config_dict.get_item("hybrid_softmax_gated")?.map(|v| v.extract().unwrap_or(false)).unwrap_or(false),
-            gated_deltanet_use_short_conv: config_dict.get_item("gated_deltanet_config")?.map(|v| {
-                if let Ok(b) = v.getattr("use_short_conv") { b.extract().unwrap_or(true) } else { true }
-            }).unwrap_or(true),
-            gated_deltanet_conv_kernel_size: config_dict.get_item("gated_deltanet_config")?.map(|v| {
-                if let Ok(k) = v.getattr("conv_kernel_size") { k.extract().unwrap_or(4) } else { 4 }
-            }).unwrap_or(4),
-            gated_deltanet_conv_bias: config_dict.get_item("gated_deltanet_config")?.map(|v| {
-                if let Ok(b) = v.getattr("conv_bias") { b.extract().unwrap_or(false) } else { false }
-            }).unwrap_or(false),
+            attention_type: config_dict.get_item("attention_type")?.and_then(|v| v.extract().ok()).unwrap_or_else(|| "softmax".to_string()),
+            hybrid_ratio: config_dict.get_item("hybrid_ratio")?.and_then(|v| v.extract().ok()).unwrap_or_else(|| "3:1".to_string()),
+            hybrid_softmax_head_dim: config_dict.get_item("hybrid_softmax_head_dim")?.and_then(|v| v.extract().ok()),
+            hybrid_softmax_num_heads: config_dict.get_item("hybrid_softmax_num_heads")?.and_then(|v| v.extract().ok()),
+            hybrid_softmax_num_kv_heads: config_dict.get_item("hybrid_softmax_num_kv_heads")?.and_then(|v| v.extract().ok()),
+            hybrid_softmax_gated: config_dict.get_item("hybrid_softmax_gated")?.and_then(|v| v.extract().ok()).unwrap_or(false),
+            gated_deltanet_use_short_conv,
+            gated_deltanet_conv_kernel_size,
+            gated_deltanet_conv_bias,
         };
 
         let dev_str = device.to_lowercase();
